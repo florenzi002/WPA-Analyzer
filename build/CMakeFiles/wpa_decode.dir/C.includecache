@@ -1,0 +1,40 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/florenzi/Documenti/juci_ws/wpa_decode/fastpbkdf2.c
+fastpbkdf2.h
+/home/florenzi/Documenti/juci_ws/wpa_decode/fastpbkdf2.h
+assert.h
+-
+string.h
+-
+endian.h
+-
+openssl/sha.h
+-
+
+/home/florenzi/Documenti/juci_ws/wpa_decode/fastpbkdf2.h
+stdlib.h
+-
+stdint.h
+-
+
+/home/florenzi/Documenti/juci_ws/wpa_decode/main.c
+fastpbkdf2.h
+/home/florenzi/Documenti/juci_ws/wpa_decode/fastpbkdf2.h
+openssl/hmac.h
+-
+openssl/sha.h
+-
+pcap.h
+-
+stdio.h
+-
+stdlib.h
+-
+
