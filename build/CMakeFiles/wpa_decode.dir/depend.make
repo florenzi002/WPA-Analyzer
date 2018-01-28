@@ -4,6 +4,10 @@
 CMakeFiles/wpa_decode.dir/fastpbkdf2.c.o: ../fastpbkdf2.c
 CMakeFiles/wpa_decode.dir/fastpbkdf2.c.o: ../fastpbkdf2.h
 
+CMakeFiles/wpa_decode.dir/hashmap.c.o: ../hashmap.c
+CMakeFiles/wpa_decode.dir/hashmap.c.o: ../hashmap.h
+
 CMakeFiles/wpa_decode.dir/main.c.o: ../fastpbkdf2.h
+CMakeFiles/wpa_decode.dir/main.c.o: ../hashmap.h
 CMakeFiles/wpa_decode.dir/main.c.o: ../main.c
 
