@@ -13,7 +13,12 @@
 #define LLC_LEN 8
 #define TAKE_N_BITS_FROM(b, p, n) ((b) >> (p)) & ((1 << (n)) - 1)
 
-typedef enum { WAITING,
+const char A[] = "Pairwise key expansion";
+const u_char NULL_MIC[16] = {0};
+
+typedef enum { WAITING_EAPOL_KEY_2,
+               WAITING_EAPOL_KEY_3,
+               WAITING_EAPOL_KEY_4,
                SUCCESS } eapol_status;
 
 /* 802.11 MAC header */
@@ -80,8 +85,10 @@ struct eapol_info {
 };
 
 u_char ap_mac_address[6];
+u_char psk[32];
 u_char *ssid;
 map_t *map;
+
 
 u_char process_beacon(const struct pcap_pkthdr *, const u_char *);
 u_char process_eapol(const struct pcap_pkthdr *, const u_char *);
@@ -96,7 +103,6 @@ int main(int argc, char *argv[]) {
   char *dev = argv[1];
   ssid = argv[2];
   u_char *pwd = argv[3];
-  u_char psk[32];
   char errbuf[PCAP_ERRBUF_SIZE];
   char filter_beacon[] = "wlan type mgt subtype beacon";
   char filter_eapol_on_ssid_mask[] = "wlan addr1 %s or wlan addr2 %s";
@@ -109,27 +115,31 @@ int main(int argc, char *argv[]) {
   ap_mac_address_str[2 * MAC_ADDR_LEN - 1] = '\0';
 
   fastpbkdf2_hmac_sha1(pwd, strlen(pwd), ssid, strlen(ssid), 4096, psk, 32);
-  
-  u_char PMK[] = "01b809f9ab2fb5dc47984f52fb2d112e13d84ccb6b86d4a7193ec5299f851c48"; 
+
+  for(int i = 0; i < 32; i++) {
+    printf("%02x", psk[i]);
+  }
+  printf("\n");
+
+  //u_char PMK[] = "01b809f9ab2fb5dc47984f52fb2d112e13d84ccb6b86d4a7193ec5299f851c48";
   //u_char passPhrase[] = "10zZz10ZZzZ";
   //u_char ssid[] = "Netgear 2/158";
-  u_char A[] = "Pairwise key expansion";
-  u_char APmac[] = "001e2ae0bdd0";
-  u_char Clientmac[] = "cc08e0620bc8";
-  u_char ANonce[] = "61c9a3f5cdcdf5fae5fd760836b8008c863aa2317022c7a202434554fb38452b";
-  u_char SNonce[] = "60eff10088077f8b03a0e2fc2fc37e1fe1f30f9f7cfbcfb2826f26f3379c4318";
-  u_char data[] = "0103005ffe010900200000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
-  
-  struct ptk *PTK = (struct ptk*) PRF512(hexstr_to_bytes(PMK), A, strlen(A), hexstr_to_bytes(APmac), hexstr_to_bytes(Clientmac), hexstr_to_bytes(ANonce), hexstr_to_bytes(SNonce));
-  
+  u_char APmac[] = "c4ea1dbe06f5";
+  u_char Clientmac[] = "b0e5ed102445";
+  u_char ANonce[] = "faf4cf7ef3e37f25e833031a971343fb39b8ef00247febb110606aa11d7ff2d4";
+  u_char SNonce[] = "30143bb717c94943f744a749058dac154759a229012c95aeccc6193cff323cff";
+  u_char data[] = "0103007502010a0000000000000000000130143bb717c94943f744a749058dac154759a229012c95aeccc6193cff323cff000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001630140100000fac020100000fac040100000fac020000";
+
+  struct ptk *PTK = (struct ptk *)PRF512(psk, A, strlen(A), hexstr_to_bytes(APmac), hexstr_to_bytes(Clientmac), hexstr_to_bytes(ANonce), hexstr_to_bytes(SNonce));
+
   int sha_length = 16;
   u_char *MIC = malloc(16);
-  HMAC(EVP_md5(), PTK->kck, 16, hexstr_to_bytes(data), 99, MIC, &sha_length);
-  for(int i = 0; i < 16; i++){
+  HMAC(EVP_sha1(), PTK->kck, 16, hexstr_to_bytes(data), 121, MIC, &sha_length);
+  for(int i = 0; i < 16; i++) {
     printf("%02x", MIC[i]);
   }
   printf("\n");
-  
+
   bpf_u_int32 mask; /* The netmask of our sniffing device */
   bpf_u_int32 net;  /* The IP of our sniffing device */
 
@@ -138,7 +148,10 @@ int main(int argc, char *argv[]) {
     net = 0;
     mask = 0;
   }
-  handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+
+  char filename[] = "../capture.pcap";
+  //handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+  handle = pcap_open_offline(filename, errbuf);
 
   if(handle == NULL) {
     fprintf(stderr, "Couldn't open device %s: %s\n", dev, errbuf);
@@ -214,6 +227,8 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
   int packet_direction = TAKE_N_BITS_FROM(hdr_802_11->frame_control[1], 0, 2);
   int data_protected = TAKE_N_BITS_FROM(hdr_802_11->frame_control[1], 6, 1);
   struct eapol_info *packet_eapol_info = NULL;
+  
+  int sha1_length = 16;
 
   u_char *sta_address;
   if(packet_direction == 2) {
@@ -233,7 +248,7 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
         printf("\n");
       }
       else {
-        //printf("Can't decrypt");
+        //printf("Can't decrypt\n");
       }
     }
     else {
@@ -246,12 +261,39 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
         if(memcmp(hdr_snap->type, ether_eapol, 2) == 0) {
           const struct sniff_802_1x_auth *hdr_802_1x;
           hdr_802_1x = (struct sniff_802_1x_auth *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + sizeof(struct sniff_LLC) + sizeof(struct sniff_SNAP));
-          if(hashmap_get(map, mac_toString(sta_address), (void **)&packet_eapol_info) == MAP_MISSING) {
-            if(packet_direction == 2) {
-              struct eapol_info *new_packet_eapol_info = malloc(sizeof(struct eapol_info));
-              hashmap_put(map, mac_toString(sta_address), new_packet_eapol_info);
-              memcpy(new_packet_eapol_info->ANonce, hdr_802_1x->wpa_key_nonce, 32);
-              new_packet_eapol_info->status = SUCCESS;
+          int get_from_hashmap_res = hashmap_get(map, mac_toString(sta_address), (void **)&packet_eapol_info);
+          if(get_from_hashmap_res == MAP_MISSING) {
+            if(packet_direction == 2) { // msg 1 or msg 3
+              if((hdr_802_1x->key_information[0] & (1 << 8)) == 0) {
+                printf("NEW ENTRY\n");
+                struct eapol_info *new_packet_eapol_info = malloc(sizeof(struct eapol_info));
+                hashmap_put(map, mac_toString(sta_address), new_packet_eapol_info);
+                memcpy(new_packet_eapol_info->ANonce, hdr_802_1x->wpa_key_nonce, 32);
+                new_packet_eapol_info->status = WAITING_EAPOL_KEY_2;
+              }
+            }
+          }
+          else if(get_from_hashmap_res == MAP_OK) {
+            eapol_status current_status = packet_eapol_info->status;
+            // printf("0x%02x%02x\n", hdr_802_1x->key_information[0], hdr_802_1x->key_information[1]);
+            // for(int ctr = 0; ctr < 8; ctr++) {
+            //   printf("%d", TAKE_N_BITS_FROM(hdr_802_1x->key_information[1], ctr, 1), packet_direction);
+            // }
+            // printf("\n");
+            if(current_status == WAITING_EAPOL_KEY_2 && packet_direction == 1 && TAKE_N_BITS_FROM(hdr_802_1x->key_information[0], 0, 1) && (TAKE_N_BITS_FROM(hdr_802_1x->key_information[1], 6, 1)) == 0 && (TAKE_N_BITS_FROM(hdr_802_1x->key_information[0], 7, 1)) == 0) { // msg 2 or msg 4
+              struct ptk *PTK = (struct ptk *)PRF512(psk, A, strlen(A), ap_mac_address, sta_address, packet_eapol_info->ANonce, hdr_802_1x->wpa_key_nonce);
+              u_char *real_MIC = malloc(16);
+              u_char *calculated_MIC = malloc(16);
+              memcpy(real_MIC, hdr_802_1x->wpa_key_MIC, 16);
+              memcpy(hdr_802_1x->wpa_key_MIC, NULL_MIC, 16);
+              HMAC(EVP_sha1(), PTK->kck, 16, hdr_802_1x, 121, calculated_MIC, &sha1_length);
+              printf("%d\n", memcmp(real_MIC, calculated_MIC, 16));
+            }
+            else if(packet_direction == 1) { // msg 2 or msg 4
+            }
+            else if(packet_direction == 2) { // msg 1 or msg 3
+            }
+            else if(packet_direction == 2) { // msg 1 or msg 3
             }
           }
         }
