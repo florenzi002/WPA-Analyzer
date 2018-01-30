@@ -12,6 +12,7 @@
 #define MAC_ADDR_LEN 6
 #define LLC_LEN 8
 #define TAKE_N_BITS_FROM(b, p, n) ((b) >> (p)) & ((1 << (n)) - 1)
+#define IS_BIG_ENDIAN (!*(unsigned char *)&(uint16_t){1})
 
 const char A[] = "Pairwise key expansion";
 const u_char NULL_MIC[16] = {0};
@@ -82,12 +83,14 @@ struct eapol_info {
   u_char SNonce[32];
   struct ptk PTK;
   eapol_status status;
+  u_char last_replay[8];
 };
 
 u_char ap_mac_address[6];
 u_char psk[32];
 u_char *ssid;
 map_t *map;
+struct ptk *PTK0;
 
 
 u_char process_beacon(const struct pcap_pkthdr *, const u_char *);
@@ -130,11 +133,11 @@ int main(int argc, char *argv[]) {
   u_char SNonce[] = "30143bb717c94943f744a749058dac154759a229012c95aeccc6193cff323cff";
   u_char data[] = "0103007502010a0000000000000000000130143bb717c94943f744a749058dac154759a229012c95aeccc6193cff323cff000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001630140100000fac020100000fac040100000fac020000";
 
-  struct ptk *PTK = (struct ptk *)PRF512(psk, A, strlen(A), hexstr_to_bytes(APmac), hexstr_to_bytes(Clientmac), hexstr_to_bytes(ANonce), hexstr_to_bytes(SNonce));
+  PTK0 = (struct ptk *)PRF512(psk, A, strlen(A), hexstr_to_bytes(APmac), hexstr_to_bytes(Clientmac), hexstr_to_bytes(ANonce), hexstr_to_bytes(SNonce));
 
   int sha_length = 16;
   u_char *MIC = malloc(16);
-  HMAC(EVP_sha1(), PTK->kck, 16, hexstr_to_bytes(data), 121, MIC, &sha_length);
+  HMAC(EVP_sha1(), PTK0->kck, 16, hexstr_to_bytes(data), 121, MIC, &sha_length);
   for(int i = 0; i < 16; i++) {
     printf("%02x", MIC[i]);
   }
@@ -227,7 +230,7 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
   int packet_direction = TAKE_N_BITS_FROM(hdr_802_11->frame_control[1], 0, 2);
   int data_protected = TAKE_N_BITS_FROM(hdr_802_11->frame_control[1], 6, 1);
   struct eapol_info *packet_eapol_info = NULL;
-  
+
   int sha1_length = 16;
 
   u_char *sta_address;
@@ -241,14 +244,10 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
   if(qos_type == 2) {
     if(data_protected) {
       if(hashmap_get(map, mac_toString(sta_address), (void **)&packet_eapol_info) == MAP_OK && packet_eapol_info->status == SUCCESS) {
-        printf("%d -> I'm going to decrypt: ", header->caplen);
-        for(int i = 0; i < 32; i++) {
-          printf("%02x", packet_eapol_info->ANonce[i]);
-        }
-        printf("\n");
+        printf("%d -> I'm going to decrypt.\n", header->caplen);
       }
       else {
-        //printf("Can't decrypt\n");
+        // Discard
       }
     }
     else {
@@ -262,38 +261,60 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
           const struct sniff_802_1x_auth *hdr_802_1x;
           hdr_802_1x = (struct sniff_802_1x_auth *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + sizeof(struct sniff_LLC) + sizeof(struct sniff_SNAP));
           int get_from_hashmap_res = hashmap_get(map, mac_toString(sta_address), (void **)&packet_eapol_info);
-          if(get_from_hashmap_res == MAP_MISSING) {
-            if(packet_direction == 2) { // msg 1 or msg 3
-              if((hdr_802_1x->key_information[0] & (1 << 8)) == 0) {
-                printf("NEW ENTRY\n");
-                struct eapol_info *new_packet_eapol_info = malloc(sizeof(struct eapol_info));
-                hashmap_put(map, mac_toString(sta_address), new_packet_eapol_info);
-                memcpy(new_packet_eapol_info->ANonce, hdr_802_1x->wpa_key_nonce, 32);
-                new_packet_eapol_info->status = WAITING_EAPOL_KEY_2;
-              }
-            }
+          
+          if(get_from_hashmap_res == MAP_MISSING && packet_direction == 2 && (TAKE_N_BITS_FROM(hdr_802_1x->key_information[0], 0, 1)) == 0) {
+            struct eapol_info *new_packet_eapol_info = malloc(sizeof(struct eapol_info));
+            hashmap_put(map, mac_toString(sta_address), new_packet_eapol_info);
+            memcpy(new_packet_eapol_info->ANonce, hdr_802_1x->wpa_key_nonce, 32);
+            memcpy(new_packet_eapol_info->last_replay, hdr_802_1x->replay_counter, 8);
+            new_packet_eapol_info->status = WAITING_EAPOL_KEY_2;
           }
           else if(get_from_hashmap_res == MAP_OK) {
             eapol_status current_status = packet_eapol_info->status;
-            // printf("0x%02x%02x\n", hdr_802_1x->key_information[0], hdr_802_1x->key_information[1]);
-            // for(int ctr = 0; ctr < 8; ctr++) {
-            //   printf("%d", TAKE_N_BITS_FROM(hdr_802_1x->key_information[1], ctr, 1), packet_direction);
-            // }
-            // printf("\n");
-            if(current_status == WAITING_EAPOL_KEY_2 && packet_direction == 1 && TAKE_N_BITS_FROM(hdr_802_1x->key_information[0], 0, 1) && (TAKE_N_BITS_FROM(hdr_802_1x->key_information[1], 6, 1)) == 0 && (TAKE_N_BITS_FROM(hdr_802_1x->key_information[0], 7, 1)) == 0) { // msg 2 or msg 4
+            u_short data_length = ((hdr_802_1x->wpa_key_data_length[0] << 8) + (hdr_802_1x->wpa_key_data_length[1]));
+            if(packet_direction == 2 && (TAKE_N_BITS_FROM(hdr_802_1x->key_information[0], 0, 1)) == 0) { // msg 1
+              hashmap_remove(map, mac_toString(sta_address));
+              struct eapol_info *new_packet_eapol_info = malloc(sizeof(struct eapol_info));
+              hashmap_put(map, mac_toString(sta_address), new_packet_eapol_info);
+              memcpy(new_packet_eapol_info->ANonce, hdr_802_1x->wpa_key_nonce, 32);
+              memcpy(new_packet_eapol_info->last_replay, hdr_802_1x->replay_counter, 8);
+              new_packet_eapol_info->status = WAITING_EAPOL_KEY_2;
+            }
+            if(current_status == WAITING_EAPOL_KEY_2 && packet_direction == 1 && TAKE_N_BITS_FROM(hdr_802_1x->key_information[0], 0, 1) && (TAKE_N_BITS_FROM(hdr_802_1x->key_information[1], 6, 1)) == 0 && (TAKE_N_BITS_FROM(hdr_802_1x->key_information[1], 7, 1)) == 0 && data_length > 0 && memcmp(packet_eapol_info->last_replay, hdr_802_1x->replay_counter, 8) == 0) { // msg 2
               struct ptk *PTK = (struct ptk *)PRF512(psk, A, strlen(A), ap_mac_address, sta_address, packet_eapol_info->ANonce, hdr_802_1x->wpa_key_nonce);
               u_char *real_MIC = malloc(16);
               u_char *calculated_MIC = malloc(16);
               memcpy(real_MIC, hdr_802_1x->wpa_key_MIC, 16);
               memcpy(hdr_802_1x->wpa_key_MIC, NULL_MIC, 16);
-              HMAC(EVP_sha1(), PTK->kck, 16, hdr_802_1x, 121, calculated_MIC, &sha1_length);
-              printf("%d\n", memcmp(real_MIC, calculated_MIC, 16));
+              HMAC(EVP_sha1(), PTK->kck, 16, hdr_802_1x, 99 + data_length, calculated_MIC, &sha1_length);
+              if(memcmp(real_MIC, calculated_MIC, 16) == 0) {
+                memcpy(packet_eapol_info->SNonce, hdr_802_1x->wpa_key_nonce, 32);
+                memcpy(&packet_eapol_info->PTK, PTK, sizeof(struct ptk));
+                packet_eapol_info->status = WAITING_EAPOL_KEY_3;
+              }
             }
-            else if(packet_direction == 1) { // msg 2 or msg 4
+            else if(current_status == WAITING_EAPOL_KEY_3 && packet_direction == 2 && TAKE_N_BITS_FROM(hdr_802_1x->key_information[0], 0, 1) && (TAKE_N_BITS_FROM(hdr_802_1x->key_information[1], 6, 1)) && (TAKE_N_BITS_FROM(hdr_802_1x->key_information[1], 7, 1))) { // msg 3
+              u_char *KCK = packet_eapol_info->PTK.kck;
+              u_char *real_MIC = malloc(16);
+              u_char *calculated_MIC = malloc(16);
+              memcpy(real_MIC, hdr_802_1x->wpa_key_MIC, 16);
+              memcpy(hdr_802_1x->wpa_key_MIC, NULL_MIC, 16);
+              HMAC(EVP_sha1(), KCK, 16, hdr_802_1x, 99 + data_length, calculated_MIC, &sha1_length);
+              if(memcmp(real_MIC, calculated_MIC, 16) == 0) {
+                packet_eapol_info->status = WAITING_EAPOL_KEY_4;
+                memcpy(packet_eapol_info->last_replay, hdr_802_1x->replay_counter, 8);
+              }
             }
-            else if(packet_direction == 2) { // msg 1 or msg 3
-            }
-            else if(packet_direction == 2) { // msg 1 or msg 3
+            else if(current_status == WAITING_EAPOL_KEY_4 && packet_direction == 1 && TAKE_N_BITS_FROM(hdr_802_1x->key_information[0], 0, 1) && (TAKE_N_BITS_FROM(hdr_802_1x->key_information[1], 6, 1)) == 0 && (TAKE_N_BITS_FROM(hdr_802_1x->key_information[1], 7, 1)) == 0 && memcmp(packet_eapol_info->last_replay, hdr_802_1x->replay_counter, 8) == 0) { // msg 4
+              u_char *KCK = packet_eapol_info->PTK.kck;
+              u_char *real_MIC = malloc(16);
+              u_char *calculated_MIC = malloc(16);
+              memcpy(real_MIC, hdr_802_1x->wpa_key_MIC, 16);
+              memcpy(hdr_802_1x->wpa_key_MIC, NULL_MIC, 16);
+              HMAC(EVP_sha1(), KCK, 16, hdr_802_1x, 99 + data_length, calculated_MIC, &sha1_length);
+              if(memcmp(real_MIC, calculated_MIC, 16) == 0) {
+                packet_eapol_info->status = SUCCESS;
+              }
             }
           }
         }
