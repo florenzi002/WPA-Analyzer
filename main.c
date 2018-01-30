@@ -96,6 +96,7 @@ struct ptk *PTK0;
 u_char process_beacon(const struct pcap_pkthdr *, const u_char *);
 u_char process_eapol(const struct pcap_pkthdr *, const u_char *);
 u_char process_packet(const struct pcap_pkthdr *, const u_char *);
+u_char *packet_decrypt(const struct pcap_pkthdr *, const u_char *);
 char *mac_toString(u_char *);
 u_char *PRF512(u_char *, u_char *, size_t, u_char *, u_char *, u_char *, u_char *);
 u_char *hexstr_to_bytes(u_char *);
@@ -244,7 +245,8 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
   if(qos_type == 2) {
     if(data_protected) {
       if(hashmap_get(map, mac_toString(sta_address), (void **)&packet_eapol_info) == MAP_OK && packet_eapol_info->status == SUCCESS) {
-        printf("%d -> I'm going to decrypt.\n", header->caplen);
+        printf("I'm going to decrypt.\n");
+        packet_decrypt(header, buffer);
       }
       else {
         // Discard
@@ -261,7 +263,7 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
           const struct sniff_802_1x_auth *hdr_802_1x;
           hdr_802_1x = (struct sniff_802_1x_auth *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + sizeof(struct sniff_LLC) + sizeof(struct sniff_SNAP));
           int get_from_hashmap_res = hashmap_get(map, mac_toString(sta_address), (void **)&packet_eapol_info);
-          
+
           if(get_from_hashmap_res == MAP_MISSING && packet_direction == 2 && (TAKE_N_BITS_FROM(hdr_802_1x->key_information[0], 0, 1)) == 0) {
             struct eapol_info *new_packet_eapol_info = malloc(sizeof(struct eapol_info));
             hashmap_put(map, mac_toString(sta_address), new_packet_eapol_info);
@@ -384,4 +386,44 @@ u_char *hexstr_to_bytes(u_char *hexstr) {
   for(size_t i = 0, j = 0; j < final_len; i += 2, j++)
     chrs[j] = (hexstr[i] % 32 + 9) % 25 * 16 + (hexstr[i + 1] % 32 + 9) % 25;
   return chrs;
+}
+
+u_char *packet_decrypt(const struct pcap_pkthdr *header, const u_char *buffer) {
+  const struct sniff_802_11 *hdr_802_11;
+  hdr_802_11 = (struct sniff_802_11 *)(buffer + PRISM_HEADER_LEN);
+  int is_a4, i, n, hdr_ccmp_offset, blocks, is_qos;
+  int data_len, last, offset;
+  u_char ccmp_aes_ctr[16], B[16], MIC[16];
+  u_char packet_number[6];
+  
+  is_a4 = (hdr_802_11->frame_control[1] & 3) == 3;
+  is_qos = (hdr_802_11->frame_control[0] & 0x8C) == 0x88;
+  hdr_ccmp_offset = 24 + 6 * is_a4;
+  hdr_ccmp_offset += 2 * is_qos;
+  
+  data_len = header->caplen - PRISM_HEADER_LEN - hdr_ccmp_offset - 8 - 4;
+  printf("%d\n", data_len);
+
+  packet_number[0] = *(buffer + PRISM_HEADER_LEN + hdr_ccmp_offset + 7);
+  packet_number[1] = *(buffer + PRISM_HEADER_LEN + hdr_ccmp_offset + 6);
+  packet_number[2] = *(buffer + PRISM_HEADER_LEN + hdr_ccmp_offset + 5);
+  packet_number[3] = *(buffer + PRISM_HEADER_LEN + hdr_ccmp_offset + 4);
+  packet_number[4] = *(buffer + PRISM_HEADER_LEN + hdr_ccmp_offset + 1);
+  packet_number[5] = *(buffer + PRISM_HEADER_LEN + hdr_ccmp_offset);
+  
+  //ccmp_aes_ctr [0x59|priority|src_addr|packet_number|ctr]
+  ccmp_aes_ctr[0] = 0x59;
+  ccmp_aes_ctr[1] = 0x00;
+  memcpy(&ccmp_aes_ctr[2], hdr_802_11->addr2, MAC_ADDR_LEN);
+  memcpy(&ccmp_aes_ctr[2 + MAC_ADDR_LEN], packet_number, 6);
+  ccmp_aes_ctr[14] = (data_len >> 8) & 0xFF;
+  ccmp_aes_ctr[15] = (data_len & 0xFF);
+  
+  u_char AAD[32] = {0};
+  AAD[2] = hdr_802_11->frame_control[0] & 0x8F;
+  AAD[3] = hdr_802_11->frame_control[1] & 0xC7;
+  memcpy( AAD + 4, &(hdr_802_11->addr1), 3 * 6 );
+  //AAD[22] = h80211[22] & 0x0F;
+  
+  
 }
