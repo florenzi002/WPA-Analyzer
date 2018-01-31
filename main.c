@@ -70,8 +70,8 @@ struct sniff_802_1x_auth {
   u_char wpa_key_data_length[2];
 };
 
-struct iphdr {
-  u_char ip_v:4, ip_hl:4;
+struct sniff_IP {
+  u_char ip_hl:4, ip_v:4;
   u_char ip_dss;
   u_char ip_total_length[2];
   u_char id[2];
@@ -82,6 +82,18 @@ struct iphdr {
   u_char hdr_checksum[2];
   u_char src[4];
   u_char dst[4];
+};
+
+struct sniff_TCP {
+  u_char src_port[2];
+  u_char dst_port[2];
+  u_char sqn_number[4];
+  u_char ack_number[4];
+  u_char hdr_len:4, reserved1:4;
+  u_char reserved2:2, urg:1, ack:1, psh:1, rst:1, syn:1, fin:1;
+  u_char window_size[2];
+  u_char tcp_checksum[2];
+  u_char urgent_pointer[2];
 };
 
 struct ptk {
@@ -106,6 +118,8 @@ u_char psk[32];
 u_char *ssid;
 map_t *map;
 struct ptk *PTK0;
+FILE *fd;
+pcap_dumper_t *dumpfile;
 
 
 u_char process_beacon(const struct pcap_pkthdr *, const u_char *);
@@ -116,6 +130,7 @@ char *mac_toString(u_char *);
 u_char *PRF512(u_char *, u_char *, size_t, u_char *, u_char *, u_char *, u_char *);
 u_char *hexstr_to_bytes(u_char *);
 static inline void XOR(unsigned char *, unsigned char *, int len);
+void dump_decrypted(u_char *, const struct pcap_pkthdr *, const u_char *);
 
 int main(int argc, char *argv[]) {
 
@@ -172,6 +187,9 @@ int main(int argc, char *argv[]) {
   char filename[] = "../capture.pcap";
   //handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
   handle = pcap_open_offline(filename, errbuf);
+  
+  fd = fopen ("test.pcap", "w");
+  dumpfile = pcap_dump_fopen(handle, fd);
 
   if(handle == NULL) {
     fprintf(stderr, "Couldn't open device %s: %s\n", dev, errbuf);
@@ -214,6 +232,7 @@ int main(int argc, char *argv[]) {
   printf("%s\n", mac_toString(ap_mac_address));
   printf(filter_eapol_on_ssid, mac_toString(ap_mac_address), mac_toString(ap_mac_address));*/
 
+  fclose(fd);
   pcap_freecode(&fp);
   pcap_close(handle);
   return (0);
@@ -263,6 +282,10 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
     if(data_protected) {
       if(hashmap_get(map, mac_toString(sta_address), (void **)&packet_eapol_info) == MAP_OK && packet_eapol_info->status == SUCCESS) {
         if(packet_decrypt(header, buffer, packet_eapol_info)) {
+          u_char new_segment = hdr_802_11->frame_control[1];
+          new_segment &= ~(1UL << 6);
+          memcpy(&hdr_802_11->frame_control[1], &new_segment, 1UL);
+          dump_decrypted((u_char *)dumpfile, header, buffer);
           const struct sniff_LLC *hdr_llc;
           hdr_llc = (struct sniff_LLC *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + 8);
           if(hdr_llc->dsap == 0xaa) {
@@ -270,10 +293,13 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
             hdr_snap = (struct sniff_SNAP *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + 8 + sizeof(struct sniff_LLC));
             u_char ether_IPv4[] = {0x08, 0x00};
             if(memcmp(hdr_snap->type, ether_IPv4, 2) == 0){
-              const struct iphdr *hdr_ip;
-              hdr_ip = (struct iphdr *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + 8 + sizeof(struct sniff_LLC) + sizeof(struct sniff_SNAP));
+              const struct sniff_IP *hdr_ip;
+              hdr_ip = (struct sniff_IP *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + 8 + sizeof(struct sniff_LLC) + sizeof(struct sniff_SNAP));
               if(hdr_ip->protocol == 0x06){
-                
+                const struct sniff_TCP *hdr_tcp;
+                //printf("hdr len: %d\n", ((int) hdr_ip->ip_hl)*32/8);
+                hdr_tcp = (struct sniff_TCP *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + 8 + sizeof(struct sniff_LLC) + sizeof(struct sniff_SNAP) + ((int) hdr_ip->ip_hl)*32/8);
+                printf("%02x%02x\n", hdr_tcp->dst_port[0], hdr_tcp->dst_port[1]);
               }
             }
           }
@@ -507,4 +533,13 @@ static inline void XOR(unsigned char *dst, unsigned char *src, int len) {
   int i;
   for(i = 0; i < len; i++)
     dst[i] ^= src[i];
+}
+
+void dump_decrypted(u_char *dumper, const struct pcap_pkthdr *header, const u_char *buffer){
+  u_char *new_buffer = malloc(header->caplen - 8);
+  size_t length = PRISM_HEADER_LEN + sizeof(struct sniff_802_11);
+  memcpy(new_buffer, buffer, length);
+  memcpy(new_buffer + length, buffer + length + 8, header->caplen - length - 8);
+  pcap_dump((u_char *)dumpfile, header, new_buffer);
+  free(new_buffer);
 }
