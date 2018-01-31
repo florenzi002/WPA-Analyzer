@@ -1,5 +1,6 @@
 #include "fastpbkdf2.h"
 #include "hashmap.h"
+#include <openssl/aes.h>
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
 #include <pcap.h>
@@ -69,6 +70,20 @@ struct sniff_802_1x_auth {
   u_char wpa_key_data_length[2];
 };
 
+struct iphdr {
+  u_char ip_v:4, ip_hl:4;
+  u_char ip_dss;
+  u_char ip_total_length[2];
+  u_char id[2];
+  u_char flags;
+  u_char fragment_offset;
+  u_char ttl;
+  u_char protocol;
+  u_char hdr_checksum[2];
+  u_char src[4];
+  u_char dst[4];
+};
+
 struct ptk {
   u_char kck[16];
   u_char kek[16];
@@ -96,10 +111,11 @@ struct ptk *PTK0;
 u_char process_beacon(const struct pcap_pkthdr *, const u_char *);
 u_char process_eapol(const struct pcap_pkthdr *, const u_char *);
 u_char process_packet(const struct pcap_pkthdr *, const u_char *);
-u_char *packet_decrypt(const struct pcap_pkthdr *, const u_char *);
+u_char packet_decrypt(const struct pcap_pkthdr *, const u_char *, struct eapol_info *);
 char *mac_toString(u_char *);
 u_char *PRF512(u_char *, u_char *, size_t, u_char *, u_char *, u_char *, u_char *);
 u_char *hexstr_to_bytes(u_char *);
+static inline void XOR(unsigned char *, unsigned char *, int len);
 
 int main(int argc, char *argv[]) {
 
@@ -235,6 +251,7 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
   int sha1_length = 16;
 
   u_char *sta_address;
+
   if(packet_direction == 2) {
     sta_address = hdr_802_11->addr1;
   }
@@ -245,8 +262,25 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
   if(qos_type == 2) {
     if(data_protected) {
       if(hashmap_get(map, mac_toString(sta_address), (void **)&packet_eapol_info) == MAP_OK && packet_eapol_info->status == SUCCESS) {
-        printf("I'm going to decrypt.\n");
-        packet_decrypt(header, buffer);
+        if(packet_decrypt(header, buffer, packet_eapol_info)) {
+          const struct sniff_LLC *hdr_llc;
+          hdr_llc = (struct sniff_LLC *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + 8);
+          if(hdr_llc->dsap == 0xaa) {
+            const struct sniff_SNAP *hdr_snap;
+            hdr_snap = (struct sniff_SNAP *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + 8 + sizeof(struct sniff_LLC));
+            u_char ether_IPv4[] = {0x08, 0x00};
+            if(memcmp(hdr_snap->type, ether_IPv4, 2) == 0){
+              const struct iphdr *hdr_ip;
+              hdr_ip = (struct iphdr *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + 8 + sizeof(struct sniff_LLC) + sizeof(struct sniff_SNAP));
+              if(hdr_ip->protocol == 0x06){
+                
+              }
+            }
+          }
+        }
+        else {
+          // Discard
+        }
       }
       else {
         // Discard
@@ -363,7 +397,7 @@ u_char *PRF512(u_char *PMK, u_char *A, size_t lenA, u_char *AP_addr, u_char *STA
   memcpy(arg, A, lenA);
   arg[lenA] = c;
   memcpy(arg + lenA + 1, B, 76);
-  printf("\n");
+
   u_char hmac_sha1_res[20];
   u_char R[((512 + 159) / 160) * 20];
   u_int sha_length = 20;
@@ -388,21 +422,20 @@ u_char *hexstr_to_bytes(u_char *hexstr) {
   return chrs;
 }
 
-u_char *packet_decrypt(const struct pcap_pkthdr *header, const u_char *buffer) {
+u_char packet_decrypt(const struct pcap_pkthdr *header, const u_char *buffer, struct eapol_info *eapol_keys) {
   const struct sniff_802_11 *hdr_802_11;
   hdr_802_11 = (struct sniff_802_11 *)(buffer + PRISM_HEADER_LEN);
   int is_a4, i, n, hdr_ccmp_offset, blocks, is_qos;
   int data_len, last, offset;
   u_char ccmp_aes_ctr[16], B[16], MIC[16];
   u_char packet_number[6];
-  
+
   is_a4 = (hdr_802_11->frame_control[1] & 3) == 3;
   is_qos = (hdr_802_11->frame_control[0] & 0x8C) == 0x88;
   hdr_ccmp_offset = 24 + 6 * is_a4;
   hdr_ccmp_offset += 2 * is_qos;
-  
-  data_len = header->caplen - PRISM_HEADER_LEN - hdr_ccmp_offset - 8 - 4;
-  printf("%d\n", data_len);
+
+  data_len = header->caplen - PRISM_HEADER_LEN - hdr_ccmp_offset - 8 - 8 - 4;
 
   packet_number[0] = *(buffer + PRISM_HEADER_LEN + hdr_ccmp_offset + 7);
   packet_number[1] = *(buffer + PRISM_HEADER_LEN + hdr_ccmp_offset + 6);
@@ -410,20 +443,68 @@ u_char *packet_decrypt(const struct pcap_pkthdr *header, const u_char *buffer) {
   packet_number[3] = *(buffer + PRISM_HEADER_LEN + hdr_ccmp_offset + 4);
   packet_number[4] = *(buffer + PRISM_HEADER_LEN + hdr_ccmp_offset + 1);
   packet_number[5] = *(buffer + PRISM_HEADER_LEN + hdr_ccmp_offset);
-  
+
   //ccmp_aes_ctr [0x59|priority|src_addr|packet_number|ctr]
   ccmp_aes_ctr[0] = 0x59;
-  ccmp_aes_ctr[1] = 0x00;
+  ccmp_aes_ctr[1] = 0;
   memcpy(&ccmp_aes_ctr[2], hdr_802_11->addr2, MAC_ADDR_LEN);
   memcpy(&ccmp_aes_ctr[2 + MAC_ADDR_LEN], packet_number, 6);
   ccmp_aes_ctr[14] = (data_len >> 8) & 0xFF;
   ccmp_aes_ctr[15] = (data_len & 0xFF);
-  
+
   u_char AAD[32] = {0};
   AAD[2] = hdr_802_11->frame_control[0] & 0x8F;
   AAD[3] = hdr_802_11->frame_control[1] & 0xC7;
-  memcpy( AAD + 4, &(hdr_802_11->addr1), 3 * 6 );
-  //AAD[22] = h80211[22] & 0x0F;
-  
-  
+  memcpy(AAD + 4, &(hdr_802_11->addr1), 3 * 6);
+  AAD[22] = hdr_802_11->sequence_control[0] & 0x0F;
+
+  if(is_qos) {
+    memcpy(&AAD[24], hdr_802_11->qos_control, 2);
+    ccmp_aes_ctr[1] = AAD[24]; //  B0[     1] = CCM Nonce flags
+    AAD[1] = 22 + 2;           // AAD[ 0.. 1] = l(a)
+  }
+  else {
+    memset(&AAD[24], 0, 2); // AAD[24..25] = QC
+    ccmp_aes_ctr[1] = 0;    //  B0[     1] = CCM Nonce flags
+    AAD[1] = 22 + 2;        // AAD[ 0.. 1] = l(a)
+  }
+
+  AES_KEY TK;
+  AES_set_encrypt_key(eapol_keys->PTK.tk, 128, &TK);
+  AES_encrypt(ccmp_aes_ctr, MIC, &TK);
+  XOR(MIC, AAD, 16);
+  AES_encrypt(MIC, MIC, &TK);
+  XOR(MIC, AAD + 16, 16);
+  AES_encrypt(MIC, MIC, &TK);
+
+  ccmp_aes_ctr[0] &= 0x07;
+  ccmp_aes_ctr[14] = ccmp_aes_ctr[15] = 0;
+  AES_encrypt(ccmp_aes_ctr, B, &TK);
+  XOR(buffer + header->caplen - 8 - 4, B, 8);
+
+  blocks = (data_len + 16 - 1) / 16;
+  last = data_len % 16;
+  offset = hdr_ccmp_offset + 8;
+
+  for(i = 1; i <= blocks; i++) {
+    n = (last > 0 && i == blocks) ? last : 16;
+
+    ccmp_aes_ctr[14] = (i >> 8) & 0xFF;
+    ccmp_aes_ctr[15] = i & 0xFF;
+
+    AES_encrypt(ccmp_aes_ctr, B, &TK); // S_i := E( K, A_i )
+    XOR(buffer + PRISM_HEADER_LEN + offset, B, n);
+    XOR(MIC, buffer + PRISM_HEADER_LEN + offset, n);
+    AES_encrypt(MIC, MIC, &TK);
+
+    offset += n;
+  }
+
+  return memcmp(buffer + PRISM_HEADER_LEN + offset, MIC, 8) == 0;
+}
+
+static inline void XOR(unsigned char *dst, unsigned char *src, int len) {
+  int i;
+  for(i = 0; i < len; i++)
+    dst[i] ^= src[i];
 }
