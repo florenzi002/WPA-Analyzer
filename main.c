@@ -187,8 +187,17 @@ int main(int argc, char *argv[]) {
 
   // read the traffic file packet by packet looking for a beacon file of the AP broadcasting the SSID specified by the user
   // stop when reach EOF or find the beacon (and thus the AP MAC address)
-  while(pcap_next_ex(handle, &header, &packet) && !process_beacon(header, packet))
+  int next_ret = 0;
+  while((next_ret = pcap_next_ex(handle, &header, &packet)) >= 0 && !process_beacon(header, packet))
     ;
+  if(next_ret == -2) {
+    fprintf(stderr, "Couldn't find the requested SSID. Reached end of capture file\n");
+    return (3);
+  }
+  else if(next_ret == -1) {
+    fprintf(stderr, "Couldn't read %s: %s\n", argv[1], pcap_geterr(handle));
+    return (2);
+  }
 
   // build the filter used for capturing traffic on specified WLAN
   asprintf(&filter_eapol_on_ssid, filter_eapol_on_ssid_mask, mac_toString(ap_mac_address), mac_toString(ap_mac_address));
@@ -202,9 +211,13 @@ int main(int argc, char *argv[]) {
   }
 
   // start processing each packet
-  while(pcap_next_ex(handle, &header, &packet) >= 0)
+  while((next_ret = pcap_next_ex(handle, &header, &packet)) >= 0) {
     process_packet(header, packet);
-
+  }
+  if(next_ret == -1) {
+    fprintf(stderr, "Couldn't read %s: %s\n", argv[1], pcap_geterr(handle));
+    return (2);
+  }
 
   fclose(fd);
   pcap_freecode(&fp);
@@ -234,18 +247,18 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
   int data_protected = TAKE_N_BITS_FROM(hdr_802_11->frame_control[1], 6, 1);
   struct eapol_info *packet_eapol_info = NULL;
 
-  u_char *sta_address;
+  u_char *sta_mac_address;
 
   if(packet_direction == 2) { // from DS
-    sta_address = hdr_802_11->addr1;
+    sta_mac_address = hdr_802_11->addr1;
   }
   else if(packet_direction == 1) { // to DS
-    sta_address = hdr_802_11->addr2;
+    sta_mac_address = hdr_802_11->addr2;
   }
   if(qos_type == 2) {
     if(data_protected) {
       // if we already stored a successful EAPOL handshake for that STA and we were able to decrypt it
-      if(hashmap_get(map, mac_toString(sta_address), (void **)&packet_eapol_info) == MAP_OK) {
+      if(hashmap_get(map, mac_toString(sta_mac_address), (void **)&packet_eapol_info) == MAP_OK) {
         if(packet_eapol_info->status == SUCCESS && packet_decrypt(header, buffer, packet_eapol_info)) {
           // dump the decrypted packet in a file
           u_char new_segment = hdr_802_11->frame_control[1];
@@ -254,21 +267,21 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
           dump_decrypted((u_char *)dumpfile, header, buffer);
 
           // print some useful info if the packet is TCP/IP
-          const struct sniff_LLC *hdr_llc;
-          hdr_llc = (struct sniff_LLC *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + 8);
-          if(hdr_llc->dsap == 0xaa) {
-            const struct sniff_SNAP *hdr_snap;
-            hdr_snap = (struct sniff_SNAP *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + 8 + sizeof(struct sniff_LLC));
-            u_char ether_IPv4[] = {0x08, 0x00};
-            if(memcmp(hdr_snap->type, ether_IPv4, 2) == 0) {
-              const struct sniff_IP *hdr_ip;
-              hdr_ip = (struct sniff_IP *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + 8 + sizeof(struct sniff_LLC) + sizeof(struct sniff_SNAP));
-              if(hdr_ip->protocol == 0x06) {
-                const struct sniff_TCP *hdr_tcp;
-                hdr_tcp = (struct sniff_TCP *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + 8 + sizeof(struct sniff_LLC) + sizeof(struct sniff_SNAP) + ((int)hdr_ip->ip_hl) * 32 / 8);
-              }
-            }
-          }
+          // const struct sniff_LLC *hdr_llc;
+          // hdr_llc = (struct sniff_LLC *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + 8);
+          // if(hdr_llc->dsap == 0xaa) {
+          //   const struct sniff_SNAP *hdr_snap;
+          //   hdr_snap = (struct sniff_SNAP *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + 8 + sizeof(struct sniff_LLC));
+          //   u_char ether_IPv4[] = {0x08, 0x00};
+          //   if(memcmp(hdr_snap->type, ether_IPv4, 2) == 0) {
+          //     const struct sniff_IP *hdr_ip;
+          //     hdr_ip = (struct sniff_IP *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + 8 + sizeof(struct sniff_LLC) + sizeof(struct sniff_SNAP));
+          //     if(hdr_ip->protocol == 0x06) {
+          //       const struct sniff_TCP *hdr_tcp;
+          //       hdr_tcp = (struct sniff_TCP *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + 8 + sizeof(struct sniff_LLC) + sizeof(struct sniff_SNAP) + ((int)hdr_ip->ip_hl) * 32 / 8);
+          //     }
+          //   }
+          // }
         }
         else {
           // Discard
@@ -290,11 +303,11 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
         if(memcmp(hdr_snap->type, ether_eapol, 2) == 0) {
           const struct sniff_802_1x_auth *hdr_802_1x;
           hdr_802_1x = (struct sniff_802_1x_auth *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + sizeof(struct sniff_LLC) + sizeof(struct sniff_SNAP));
-          int get_from_hashmap_res = hashmap_get(map, mac_toString(sta_address), (void **)&packet_eapol_info);
+          int get_from_hashmap_res = hashmap_get(map, mac_toString(sta_mac_address), (void **)&packet_eapol_info);
           // if we don't have info about WPA handshake for that STA and this message is the first one of the handshake, we start listening for the handshake to complete
           if(get_from_hashmap_res == MAP_MISSING && packet_direction == 2 && (TAKE_N_BITS_FROM(hdr_802_1x->key_information[0], 0, 1)) == 0) {
             struct eapol_info *new_packet_eapol_info = malloc(sizeof(struct eapol_info));
-            hashmap_put(map, mac_toString(sta_address), new_packet_eapol_info);
+            hashmap_put(map, mac_toString(sta_mac_address), new_packet_eapol_info);
             memcpy(new_packet_eapol_info->ANonce, hdr_802_1x->wpa_key_nonce, 32);
             memcpy(new_packet_eapol_info->last_replay, hdr_802_1x->replay_counter, 8);
             new_packet_eapol_info->status = WAITING_EAPOL_KEY_2;
@@ -304,9 +317,9 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
             u_short data_length = ((hdr_802_1x->wpa_key_data_length[0] << 8) + (hdr_802_1x->wpa_key_data_length[1]));
             if(packet_direction == 2 && (TAKE_N_BITS_FROM(hdr_802_1x->key_information[0], 0, 1)) == 0) { // the AP is demanding for a new handshake
               // we remove previous informations and start listening for the new handshake
-              hashmap_remove(map, mac_toString(sta_address));
+              hashmap_remove(map, mac_toString(sta_mac_address));
               struct eapol_info *new_packet_eapol_info = malloc(sizeof(struct eapol_info));
-              hashmap_put(map, mac_toString(sta_address), new_packet_eapol_info);
+              hashmap_put(map, mac_toString(sta_mac_address), new_packet_eapol_info);
               memcpy(new_packet_eapol_info->ANonce, hdr_802_1x->wpa_key_nonce, 32);
               memcpy(new_packet_eapol_info->last_replay, hdr_802_1x->replay_counter, 8);
               new_packet_eapol_info->status = WAITING_EAPOL_KEY_2;
@@ -314,7 +327,7 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
             // is the message is the second one of the 4WHS and we were waiting for it
             if(current_status == WAITING_EAPOL_KEY_2 && packet_direction == 1 && TAKE_N_BITS_FROM(hdr_802_1x->key_information[0], 0, 1) && (TAKE_N_BITS_FROM(hdr_802_1x->key_information[1], 6, 1)) == 0 && (TAKE_N_BITS_FROM(hdr_802_1x->key_information[1], 7, 1)) == 0 && data_length > 0 && memcmp(packet_eapol_info->last_replay, hdr_802_1x->replay_counter, 8) == 0) { // msg 2
               // we have all the infos needed for the computation of PTK
-              struct ptk *PTK = (struct ptk *)PRF512(psk, A, strlen(A), ap_mac_address, sta_address, packet_eapol_info->ANonce, hdr_802_1x->wpa_key_nonce);
+              struct ptk *PTK = (struct ptk *)PRF512(psk, A, strlen(A), ap_mac_address, sta_mac_address, packet_eapol_info->ANonce, hdr_802_1x->wpa_key_nonce);
               u_char *real_MIC = malloc(16);
               u_char *calculated_MIC = malloc(16);
               memcpy(real_MIC, hdr_802_1x->wpa_key_MIC, 16);
@@ -349,6 +362,7 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
               memcpy(hdr_802_1x->wpa_key_MIC, NULL_MIC, 16);
               HMAC(EVP_sha1(), KCK, 16, hdr_802_1x, 99 + data_length, calculated_MIC, &SHA1_LENGTH);
               if(memcmp(real_MIC, calculated_MIC, 16) == 0) {
+                printf("Handshake completed between %s - %s\n", mac_toString(sta_mac_address), mac_toString(ap_mac_address));
                 packet_eapol_info->status = SUCCESS;
               }
             }
@@ -361,12 +375,14 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
 }
 
 char *mac_toString(u_char *addr) {
-  static char str[18];
+  char str[18];
+  char *res_str = malloc(18);
   if(addr == NULL)
     return "";
   snprintf(str, sizeof(str), "%02x:%02x:%02x:%02x:%02x:%02x",
            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
-  return str;
+  memcpy(res_str, str, 18);
+  return res_str;
 }
 
 u_char *PRF512(u_char *PMK, u_char *A, size_t lenA, u_char *AP_addr, u_char *STA_addr, u_char *ANonce, u_char *SNonce) {
@@ -459,13 +475,13 @@ u_char packet_decrypt(const struct pcap_pkthdr *header, const u_char *buffer, st
 
   if(is_qos) {
     memcpy(&AAD[24], hdr_802_11->qos_control, 2);
-    ccmp_aes_ctr[1] = AAD[24]; //  B0[     1] = CCM Nonce flags
-    AAD[1] = 22 + 2;           // AAD[ 0.. 1] = l(a)
+    ccmp_aes_ctr[1] = AAD[24];
+    AAD[1] = 22 + 2;
   }
   else {
-    memset(&AAD[24], 0, 2); // AAD[24..25] = QC
-    ccmp_aes_ctr[1] = 0;    //  B0[     1] = CCM Nonce flags
-    AAD[1] = 22 + 2;        // AAD[ 0.. 1] = l(a)
+    memset(&AAD[24], 0, 2);
+    ccmp_aes_ctr[1] = 0;
+    AAD[1] = 22 + 2;
   }
 
   AES_KEY TK;
