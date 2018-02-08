@@ -130,6 +130,7 @@ map_t *map;
 struct ptk *PTK0;
 FILE *fd;
 pcap_dumper_t *dumpfile;
+long decrypted_packet_count, encrypted_packet_count;
 
 
 u_char process_beacon(const struct pcap_pkthdr *, const u_char *);
@@ -156,9 +157,14 @@ int main(int argc, char *argv[]) {
   const u_char *packet;
   char ap_mac_address_str[2 * MAC_ADDR_LEN]; // String representation of MAC address as xx:xx:xx:xx:xx:xx
   ap_mac_address_str[2 * MAC_ADDR_LEN - 1] = '\0';
+  long packet_count = 0;
 
   fastpbkdf2_hmac_sha1(pwd, strlen(pwd), ssid, strlen(ssid), 4096, psk, 32); // compute PSK from PWD, in WPA2-PSK PSK == PMS
-
+  printf("PMK is: ");
+  for(int i = 0; i < 32; i++){
+    printf("%02x", psk[i]);
+  }
+  printf("\n\n");
   // open the file of the capture and an handle for its content
   handle = pcap_open_offline(argv[1], errbuf);
   if(handle == NULL) {
@@ -213,11 +219,14 @@ int main(int argc, char *argv[]) {
   // start processing each packet
   while((next_ret = pcap_next_ex(handle, &header, &packet)) >= 0) {
     process_packet(header, packet);
+    packet_count++;
   }
   if(next_ret == -1) {
     fprintf(stderr, "Couldn't read %s: %s\n", argv[1], pcap_geterr(handle));
     return (2);
   }
+  
+  printf("\ndecrypted %ld/%ld encrypted packets out of %ld on the network %s\n", decrypted_packet_count, encrypted_packet_count, packet_count, ssid);
 
   fclose(fd);
   pcap_freecode(&fp);
@@ -257,6 +266,7 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
   }
   if(qos_type == 2) {
     if(data_protected) {
+      encrypted_packet_count++;
       // if we already stored a successful EAPOL handshake for that STA and we were able to decrypt it
       if(hashmap_get(map, mac_toString(sta_mac_address), (void **)&packet_eapol_info) == MAP_OK) {
         if(packet_eapol_info->status == SUCCESS && packet_decrypt(header, buffer, packet_eapol_info)) {
@@ -265,7 +275,7 @@ u_char process_packet(const struct pcap_pkthdr *header, const u_char *buffer) {
           new_segment &= ~(1UL << 6);
           memcpy(&hdr_802_11->frame_control[1], &new_segment, 1UL);
           dump_decrypted((u_char *)dumpfile, header, buffer);
-
+          decrypted_packet_count++;
           // print some useful info if the packet is TCP/IP
           // const struct sniff_LLC *hdr_llc;
           // hdr_llc = (struct sniff_LLC *)(buffer + PRISM_HEADER_LEN + sizeof(struct sniff_802_11) + 8);
